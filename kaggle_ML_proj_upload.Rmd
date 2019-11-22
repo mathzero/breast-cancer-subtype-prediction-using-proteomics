@@ -1,0 +1,858 @@
+---
+title: "ML_project_cleaner"
+author: "Matt Whitaker"
+date: "06/02/2019"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+#loading required libraries
+library(stabs)
+library(factoextra)
+library(NbClust)
+library(FunCluster)
+library(ggfortify)
+library(glmnet)
+require(foreign)
+require(ggplot2)
+require(MASS)
+require(Hmisc)
+require(reshape2)
+library(randomForest)
+library(data.table)
+library(mlr)
+library(h2o)
+library(caret)
+library(plsVarSel)
+library(pROC)
+library(jtools)
+library(dplyr)
+library(cluster)
+library("flexclust")
+library(corrplot)
+library(tsne)
+library(clusterCrit)
+```
+
+
+```{r}
+#import data
+
+
+gene_proteins <- read.csv("PAM50_proteins.csv")
+clinical <- read.csv("clinical_data_breast_cancer.csv")
+proteomes <- read.csv("77_cancer_proteomes_CPTAC_itraq.csv")
+
+```
+
+```{r}
+#transposing proteome matrix to make observations into rows
+
+#save rownames
+n <- proteomes$RefSeq_accession_number
+
+# transpose all but the first 3 column 
+proteomes <- as.data.frame(t(proteomes[,4:86]))
+colnames(proteomes) <- n
+
+#rownames to first column
+proteomes <- cbind(rownames(proteomes), data.frame(proteomes, row.names=NULL))
+colnames(proteomes)[1] <- "Complete.TCGA.ID"
+```
+
+```{r}
+#reformatting Complete.TCGA.ID as clinical format to allow joining of data sets
+
+#defining formula to restructure:
+get.clinical.id <- function(proteome.id) {
+  x = substr(proteome.id, 4, 7)
+  y = substr(proteome.id, 0, 2)
+  paste("TCGA",y,x,sep="-")
+}
+
+#sapply to id column in proteomes
+proteomes$Complete.TCGA.ID <- sapply(proteomes$Complete.TCGA.ID, get.clinical.id)
+proteomes_all <- proteomes
+```
+
+```{r Dealing with missing data}
+#looking for proteomes with many NAs
+naCounts <- colSums(is.na(proteomes)) / nrow(proteomes)
+
+#plotting missing data proportions
+png("missingdataplot.png", width = 800, height = 500)
+missinfDataPlot <- plot(sort(naCounts, decreasing = TRUE), col ="red", type = 'h', xlab = "index of proteome", ylab="proportion of missing data", main = "Propotion of missing data for each proteome") 
+dev.off()
+
+#ggplot version of plot
+ggplot(data=data.frame(sort(naCounts, decreasing = TRUE)), aes(naCounts)) + geom_bar()
+
+#how many have more than 10% missing data
+length(naCounts[naCounts>0.1])
+proteomes <- proteomes[ , colSums(is.na(proteomes))  / nrow(proteomes) < 0.1] #removing variables with >10% missing data
+
+
+
+
+
+```
+
+
+```{r Imputing means for remaining missing data}
+#function for imputing means
+for (i in which(sapply(proteomes, is.numeric))) {
+    proteomes[is.na(proteomes[, i]), i] <- mean(proteomes[, i],  na.rm = TRUE)
+}
+
+sum(is.na(proteomes))
+```
+
+
+
+
+
+```{r Creating full combined data set}
+#left join on data to create full data set
+library(dplyr)
+
+data <-  inner_join(clinical, proteomes, by = "Complete.TCGA.ID")
+
+#replacing lengthy col name
+colnames(data)[3] <- "diag_age"
+
+```
+
+```{r}
+#creating test/train split index
+samp <- createDataPartition(data$PAM50.mRNA, p = 0.7, list = FALSE)
+```
+
+```{r Creating test and training data sets}
+
+X_train <- data.matrix(data[samp, 31:ncol(data)])
+y_train <- data.matrix(data[samp,]$PAM50.mRNA)
+X_test <- data.matrix(data[-samp, 31:ncol(data)])
+y_test <- data.matrix(data[-samp,]$PAM50.mRNA)
+
+sum(is.na(X_train))
+```
+
+
+```{r Lasso regression to select parameters}
+#Setting up parameters 
+grid <- 10^seq(5,-5, length =100)
+
+set.seed (1)
+cv.out<-cv.glmnet(X_train,y_train,alpha=1,lambda =grid,family="multinomial",type.multinomial="grouped")
+lasso_plot <- plot(cv.out)
+bestlam<-cv.out$lambda.1se
+
+#  The results of the Lasso data reduction technique are exported onto your local machine for optimal viewing.
+out<-glmnet(X,y,alpha =1, lambda=grid,family="multinomial",type.multinomial="grouped")
+lasso.coef<-predict(out,type ="coefficients",s=bestlam,family="multinomial",type.multinomial="grouped")
+sink(file="lasso.txt")
+options("max.print"=8020)
+lasso.coef
+sink(NULL)
+
+
+png("lasso_lambda_plots.png", width = 2000, height=1200)
+par(mfrow=c(2,2),mar=c(0,0,0,0))
+plot(cv.out$glmnet.fit, "lambda", label=TRUE)
+dev.off()
+
+
+```
+
+
+
+
+```{r}
+#extracting relevant proteins
+coefsMin <- coef(cv.out, s="lambda.min")
+
+betas1 <-  as.data.frame(as.matrix(coefsMin$`Basal-like`))
+betas1$protein <- rownames(betas1)
+betas1 <- betas1[betas1$`1` != 0,]
+betas1 <- betas1[2:nrow(betas1),]
+
+betas2 <-  as.data.frame(as.matrix(coefsMin$`HER2-enriched`))
+betas2$protein <- rownames(betas2)
+betas2 <- betas2[betas2$`1` != 0,]
+betas2 <- betas2[2:nrow(betas2),]
+
+betas3 <-  as.data.frame(as.matrix(coefsMin$`Luminal A`))
+betas3$protein <- rownames(betas3)
+betas3 <- betas3[betas3$`1` != 0,]
+betas3 <- betas3[2:nrow(betas3),]
+
+betas4 <-  as.data.frame(as.matrix(coefsMin$`Luminal B`))
+betas4$protein <- rownames(betas4)
+betas4 <- betas4[betas4$`1` != 0,]
+betas4 <- betas4[2:nrow(betas4),]
+
+all.betas <- rbind(betas1,betas2,betas3,betas4)
+
+colnames(all.betas) <- c("beta_val","RefSeqProteinID")
+all.betas <- all.betas[order(-abs(all.betas$beta_val)),]
+
+
+sig.proteins <- (all.betas$RefSeqProteinID)
+
+sig.proteins <- unique(sig.proteins)
+pam50.proteins <- as.character(gene_proteins$RefSeqProteinID)
+
+protein_PAM50_match <- full_join(gene_proteins,all.betas)
+
+protein_PAM50_match
+
+plot(as.matrix(all.betas), x="RefSeqProteinID", y="beta_val")
+
+ggplot(all.betas[,], aes(x=reorder(as.factor(RefSeqProteinID),-abs(beta_val),mean), y=beta_val, col =reorder(as.factor(RefSeqProteinID),-abs(beta_val),mean), fill=reorder(as.factor(RefSeqProteinID),-abs(beta_val),mean)))+ geom_col(show.legend = FALSE, alpha = 0.5) + theme(axis.text.x = element_text(angle = 90, hjust = 1), axis.text=element_text(size=5)) + xlab("Protein") + ylab("Beta values")
+
+ggsave("Beta_vals_lasso.png", plot = last_plot(), device = "png", width = 6, height = 4)
+
+
+all.betas$protein
+```
+
+```{r Discovering how many of the gene proteins are in the originl proteomic data set (before NA removal)}
+geneproteins_list <- as.character(gene_proteins$RefSeqProteinID)
+
+gene_prots_present <- which(colnames(proteomes) %in% geneproteins_list)
+
+gene_prots_NA_remove <- which(colnames(proteomes_all) %in% geneproteins_list)
+
+length(gene_prots_present)
+length(gene_prots_NA_remove)
+```
+
+
+
+```{r Indexing into data frame with sig.proetins}
+prot.ind <- which(colnames(data) %in% sig.proteins)
+prot.ind.10 <- prot.ind[1:10]
+prot.ind.20 <- prot.ind[1:20]
+data[,prot.ind]
+
+
+pam50.ind <- which(colnames(data) %in% pam50.proteins )
+
+```
+
+
+
+```{r STABLE VARIABLE SELECTION WITH LASSO}
+## Stability analyses
+
+LassoSub=function(k=1, Xdata, Ydata){
+  set.seed(k)
+  s=sample(nrow(data), size=0.8*nrow(data))
+  Xsub=Xdata[s, ]
+  Ysub=Ydata[s]
+  model.sub=cv.glmnet(x=Xsub, y=Ysub, alpha=1, family="multinomial")
+  coef.sub=coef(model.sub, s='lambda.1se')[-1]
+  return(coef.sub)
+}
+
+t0=Sys.time()
+niter=100
+lasso.stab=sapply(1:niter, FUN=LassoSub, Xdata=as.matrix(data[,31:ncol(data)]), Ydata=as.matrix(data[,21]))
+t1=Sys.time()
+print(t1-t0)
+
+
+
+
+lasso.prop=apply(lasso.stab, 1, FUN=function(x){sum(x!=0)/length(x)})
+names(lasso.prop)=colnames(data[,31:ncol(data)])
+
+lasso.prop=sort(lasso.prop, decreasing = TRUE)
+plot(lasso.prop[lasso.prop>0.2], type = 'h', col='navy', lwd=3, xaxt='n', 
+     xlab='', ylab=expression(beta), ylim=c(0,1.2), las=1)
+text(lasso.prop[lasso.prop>0.2]+0.07, labels = names(lasso.prop[lasso.prop>0.2]), 
+     pos=3, srt=90, cex=0.7)
+
+
+
+stability_matrix <- matrix(nrow=length(lasso.stab[[1]]),ncol=length(lasso.stab))
+rownames(stability_matrix) <- rownames(lasso.stab[[1]])
+
+for (i in 1:300){
+  temp.data.frame <- as.matrix(lasso.stab[[i]])
+  stability_matrix[,i] <- temp.data.frame
+}
+
+
+stability_matrix <- ifelse(stability_matrix != 0, 1, 0)
+
+stability_matrix <- stability_matrix[2:nrow(stability_matrix),]
+
+stable_variables <- as.data.frame(rowSums(stability_matrix))
+
+stable_variables$protein <- rownames(stable_variables)
+stable_variables <- stable_variables[stable_variables != 0,]
+colnames(stable_variables)[1] <- "times_selected"
+stable_variables <- stable_variables[1:368,]
+
+stable_variables <- stable_variables[order(-stable_variables$times_selected),]
+
+
+#plotting stable variables
+stable_variables_plot <- ggplot(stable_variables[1:30,], aes(x=reorder(as.factor(protein),-abs(times_selected),mean), y=times_selected, col =reorder(as.factor(protein),-abs(times_selected),mean), fill =reorder(as.factor(protein),-abs(times_selected),mean))) + geom_col(show.legend = FALSE, alpha = 0.6) + theme(axis.text.x = element_text(angle = 90, hjust = 1), axis.text=element_text(size=10)) + xlab("Protein") + ylab("Times selected")
+ggsave("stable_variables_plot.png", plot = last_plot(), device = "png", width = 6, height = 4)
+
+
+STABVARS <- stable_variables$protein[1:30]
+
+STABVARS.ind <- which(colnames(data) %in% STABVARS)
+```
+
+
+
+
+
+```{r Data visualisation and exploration}
+#distributions of lasso selected variables accross cancer subtypes
+
+ggplot(data, aes(PAM50.mRNA, NP_004453, col=PAM50.mRNA, fill=PAM50.mRNA)) + geom_boxplot(alpha=0.3) + ggtitle("NP_004453")
+ggsave("NP_004453_lasso.png", plot = last_plot(), device = "png")
+ggplot(data, aes(PAM50.mRNA, NP_660208, col=PAM50.mRNA, fill=PAM50.mRNA)) + geom_boxplot(alpha=0.3) + ggtitle("NP_660208")
+ggsave("NP_660208_lasso.png", plot = last_plot(), device = "png")
+ggplot(data, aes(PAM50.mRNA, NP_001258898, col=PAM50.mRNA, fill=PAM50.mRNA)) + geom_boxplot(alpha=0.3) + ggtitle("NP_001258898")
+ggsave("NP_NP_001258898_lasso.png", plot = last_plot(), device = "png")
+ggplot(data, aes(PAM50.mRNA, NP_005970, col=PAM50.mRNA, fill=PAM50.mRNA)) + geom_boxplot(alpha=0.3) + ggtitle("NP_005970")
+ggsave("NP_005970_lasso.png", plot = last_plot(), device = "png")
+
+ggplot(data, aes(PAM50.mRNA, NP_005219, col=PAM50.mRNA, fill=PAM50.mRNA)) + geom_boxplot(alpha=0.3) + ggtitle("NP_005219")
+ggsave("NP_005219_pam50_and_lasso.png", plot = last_plot(), device = "png")
+
+
+
+ggplot(data, aes(PAM50.mRNA, NP_004388, col=PAM50.mRNA, fill=PAM50.mRNA)) + geom_boxplot(alpha=0.3) + ggtitle("NP_006524")
+ggsave("NP_006524_pam50.png", plot = last_plot(), device = "png")
+ggplot(data, aes(PAM50.mRNA, NP_001243806, col=PAM50.mRNA, fill=PAM50.mRNA)) + geom_boxplot(alpha=0.3) + ggtitle("NP_002002")
+ggsave("NP_002002_pam50.png", plot = last_plot(), device = "png")
+ggplot(data, aes(PAM50.mRNA, NP_057195, col=PAM50.mRNA, fill=PAM50.mRNA)) + geom_boxplot(alpha=0.3) + ggtitle("NP_998812")
+ggsave("NP_998812_pam50.png", plot = last_plot(), device = "png")
+ggplot(data, aes(PAM50.mRNA, NP_055945, col=PAM50.mRNA, fill=PAM50.mRNA)) + geom_boxplot(alpha=0.3) + ggtitle("NP_075252")
+ggsave("NP_075252_pam50.png", plot = last_plot(), device = "png")
+
+
+heatmap <- heatmap(as.matrix(proteomes[,2:8741]), na.rm = TRUE)
+
+png("heatmap.png")
+heatmap(as.matrix(proteomes[,2:8741]), na.rm = TRUE, key = TRUE)
+dev.off()
+
+
+png("heatmap_PAM50.png")
+heatmap(as.matrix(proteomes[,pam50.ind]), na.rm = TRUE, key = TRUE)
+dev.off()
+
+ggplot(data, aes(PAM50.mRNA, col = PAM50.mRNA, fill = PAM50.mRNA, alpha=0.7)) + geom_bar()
+ggsave("cancer_subtype_barchart.png", plot = last_plot(), device = "png")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Model building
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+train <- data[samp, c(21, prot.ind)]
+test <- data[-samp, c(21, prot.ind)]
+
+X <- data.matrix(data[, c(21,prot.ind)])
+y <- data.matrix(data[,]$PAM50.mRNA)
+```
+
+```{r Building data frame to save info from all models}
+
+model_analysis <- data.frame(matrix(ncol = 6, nrow = 10))
+
+colnames(model_analysis) <- c("Model_type", "Variables", "Hyperparameters", "Kappa", "Train_accuracy", "Test_accuracy")
+
+```
+
+
+
+```{r Tuning and training random forest model}
+train_control <- trainControl(method="repeatedcv", number=3, repeats=10, savePredictions = TRUE, summaryFunction = multiClassSummary) 
+rf.mod <- train(PAM50.mRNA ~ ., data=data[samp, c(21, STABVARS.ind)], trControl=train_control, method="rf", preProcess = c("center","scale"))
+
+rf.predicts <- predict(rf.mod, newdata = data[-samp, c(21, STABVARS.ind)])
+
+plot(rf.predicts)
+
+
+conf1 <- confusionMatrix(rf.predicts, test$PAM50.mRNA)
+
+model_analysis[1,1] <- "Random Forest"
+model_analysis[1,2] <- "Lasso selected (p=30)"
+model_analysis[1,3] <- paste("Mtry = ",rf.mod$bestTune$mtry)
+model_analysis[1,4] <- rf.mod$results$Kappa[1]
+model_analysis[1,5] <- rf.mod$results$Accuracy[1]
+model_analysis[1,6] <- conf1$overall[1]
+```
+
+
+
+```{r Comparing random forest with my isolated predictors against pre-identified PAM50 gene predictors}
+
+rf.mod2 <- train(PAM50.mRNA ~ ., data=data[samp, c(21, pam50.ind)], trControl=train_control, method="rf", preProcess = c("center","scale"))
+
+rf.predicts2 <- predict(rf.mod2, newdata = data[-samp, c(21, pam50.ind)])
+
+conf2 <- confusionMatrix(rf.predicts2, test$PAM50.mRNA)
+
+rf.mod2
+
+model_analysis[2,1] <- "Random Forest"
+model_analysis[2,2] <- "Selected by prior knowledge (p=21)"
+model_analysis[2,3] <- "Mtry = 2"
+model_analysis[2,4] <- rf.mod2$results$Kappa[1]
+model_analysis[2,5] <- rf.mod2$results$Accuracy[1]
+model_analysis[2,6] <- conf2$overall[1]
+```
+
+
+
+```{r Tuning and fitting SVM linear kernel}
+grid <- expand.grid(C = seq(0.000001,0.15,0.002))
+svm.lin.mod <- train(PAM50.mRNA ~ ., data=data[samp, c(21, STABVARS.ind)], trControl=train_control, method="svmLinear", preProcess = c("center","scale"), tuneGrid =grid, tuneLength = 10)
+
+svm.predicts <- predict(svm.lin.mod, newdata = data[-samp, c(21, STABVARS.ind)])
+train.preds <- predict(svm.lin.mod)
+
+confusionMatrix(svm.predicts, test$PAM50.mRNA)
+
+plot(svm.lin.mod)
+
+svm.lin.mod
+svm.lin.mod$results$Accuracy
+
+ggplot(svm.lin.mod, aes(x = Training_Size, y = ROC, color = Data)) + geom_smooth(method = loess, span = .8) + theme_bw()
+
+conf3 <- confusionMatrix(svm.predicts, test$PAM50.mRNA)
+
+conf3
+
+model_analysis[3,1] <- "Supprt vector machine"
+model_analysis[3,2] <- "Lasso selected (p=30)"
+model_analysis[3,3] <- paste("Linear Kernel. C =", svm.lin.mod$bestTune$C)
+model_analysis[3,4] <- svm.lin.mod$results$Kappa[12]
+model_analysis[3,5] <- svm.lin.mod$results$Accuracy[12]
+model_analysis[3,6] <- conf3$overall[1]
+
+
+```
+
+
+
+```{r Tuning and fitting SVM linear kernel with PAM50 variables}
+grid <- expand.grid(C = seq(0.000001,0.5,0.005))
+svm.lin.mod2 <- train(PAM50.mRNA ~ ., data=data[samp, c(21, pam50.ind)], trControl=train_control, method="svmLinear", preProcess = c("center","scale"), tuneGrid =grid, tuneLength = 10)
+
+svm.predicts2 <- predict(svm.lin.mod2, newdata = data[-samp, c(21, pam50.ind)])
+
+
+confusionMatrix(svm.predicts2, test$PAM50.mRNA)
+
+plot(svm.lin.mod2)
+
+svm.lin.mod2$results$Accuracy
+
+
+ggplot(svm.lin.mod2, aes(x = Training_Size, y = ROC, color = Data)) + geom_smooth(method = loess, span = .8) + theme_bw()
+
+conf4 <- confusionMatrix(svm.predicts, test$PAM50.mRNA)
+
+
+
+model_analysis[4,1] <- "Supprt vector machine"
+model_analysis[4,2] <- "Selected by prior knowledge (p=21)"
+model_analysis[4,3] <- paste("Linear Kernel. C = ", svm.lin.mod2$bestTune$C)
+model_analysis[4,4] <- svm.lin.mod2$results$Kappa[12]
+model_analysis[4,5] <- svm.lin.mod2$results$Accuracy[12]
+model_analysis[4,6] <- conf4$overall[1]
+```
+
+
+
+
+```{r Fitting KNN algorithm}
+grid <- expand.grid(k = seq(1,20,1))
+knn.mod <- train(PAM50.mRNA ~ ., data=data[samp, c(21, STABVARS.ind)], trControl=train_control, method="knn", preProcess = c("center","scale"),  tuneLength = 10, tuneGrid =grid)
+
+knn.predicts <- predict(knn.mod, newdata = data[-samp, c(21, STABVARS.ind)])
+
+conf5 <- confusionMatrix(knn.predicts, test$PAM50.mRNA)
+
+knn.mod$results
+
+conf5
+
+
+png("knn_neighbours_plot_lasso.png")
+plot(knn.mod)
+dev.off()
+
+
+model_analysis[5,1] <- "K Nearest neighbours"
+model_analysis[5,2] <- "Lasso selected (p=71)"
+model_analysis[5,3] <- paste("K =", knn.mod$bestTune$k)
+model_analysis[5,4] <- knn.mod$results$Kappa[5]
+model_analysis[5,5] <- knn.mod$results$Accuracy[5]
+model_analysis[5,6] <- conf5$overall[1]
+```
+
+
+
+```{r Fitting KNN algorithm with a priori variables}
+
+knn.mod2 <- train(PAM50.mRNA ~ ., data=data[samp, c(21, pam50.ind)], trControl=train_control, method="knn", preProcess = c("center","scale"),  tuneLength = 10)
+
+knn.predicts2 <- predict(knn.mod2, newdata = data[-samp, c(21, pam50.ind)])
+
+conf6 <- confusionMatrix(knn.predicts2, test$PAM50.mRNA)
+
+knn.mod2$results
+
+png("knn_neighbours_plot_pam50.png")
+plot(knn.mod2)
+dev.off()
+
+model_analysis[6,1] <- "K Nearest neighbours"
+model_analysis[6,2] <- "Selected by prior knowledge (p=21)"
+model_analysis[6,3] <- paste("K =", knn.mod2$bestTune$k)
+model_analysis[6,4] <- knn.mod2$results$Kappa[3]
+model_analysis[6,5] <- knn.mod2$results$Accuracy[3]
+model_analysis[6,6] <- conf6$overall[1]
+
+```
+
+
+
+
+
+```{r Fitting penalised multinom logistic regression algorith}
+grid <- expand.grid(decay = seq(0,10,0.2))
+glm.mod <- train(PAM50.mRNA ~ ., data=data[samp, c(21, STABVARS.ind)], trControl=train_control, method="multinom", preProcess = c("center","scale"),  tuneLength = 10,tuneGrid =grid)
+
+glm.mod.predicts <- predict(glm.mod, newdata = data[-samp, c(21, STABVARS.ind)])
+
+conf7 <- confusionMatrix(glm.mod.predicts, test$PAM50.mRNA)
+conf7
+
+glm.mod$results$Kappa
+
+glm.mod$bestTune
+
+png("penalised_log_mod_weight_decay.png")
+plot(glm.mod)
+dev.off()
+
+model_analysis[7,1] <- "Penalised multinomial logistic regression"
+model_analysis[7,2] <- "Lasso selected (p=20)"
+model_analysis[7,3] <- paste("Decay =", glm.mod$bestTune$decay)
+model_analysis[7,4] <- glm.mod$results$Kappa[9]
+model_analysis[7,5] <- glm.mod$results$Accuracy[9]
+model_analysis[7,6] <- conf7$overall[1]
+```
+
+
+
+```{r Fitting penalised multinom logistic regression algorith with a priori variables}
+grid <- expand.grid(decay = seq(0,100,2))
+glm.mod2 <- train(PAM50.mRNA ~ ., data=data[samp, c(21, pam50.ind)], trControl=train_control, method="multinom", preProcess = c("center","scale"),  tuneLength = 10,tuneGrid =grid)
+
+glm.mod.predicts2 <- predict(glm.mod2, newdata = data[-samp, c(21, pam50.ind)])
+
+conf8 <- confusionMatrix(glm.mod.predicts2, test$PAM50.mRNA)
+(conf8)
+
+glm.mod2$results
+
+glm.mod2$bestTune$decay
+
+plot(glm.mod2)
+
+model_analysis[8,1] <- "Penalised multinomial logistic regression"
+model_analysis[8,2] <- "Selected by prior knowledge (p=21)"
+model_analysis[8,3] <- paste("Decay =", glm.mod2$bestTune$decay)
+model_analysis[8,4] <- glm.mod2$results$Kappa[10]
+model_analysis[8,5] <- glm.mod2$results$Accuracy[10]
+model_analysis[8,6] <- conf8$overall[1]
+```
+
+
+ditplot!
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#Clustering
+
+
+
+```{r}
+set.seed(123)
+
+# Elbow method
+elbow_plot <- fviz_nbclust(data[, 31:8770], kmeans, method = "wss") +
+    geom_vline(xintercept = 4, linetype = 2)+
+  labs(subtitle = "Elbow method")
+
+# Silhouette method
+silhouette_plot <- fviz_nbclust(data[, 31:8770], kmeans, method = "silhouette")+
+  labs(subtitle = "Silhouette method")
+
+# Gap statistic
+# nboot = 50 to keep the function speedy. 
+# recommended value: nboot= 500 for your analysis.
+# Use verbose = FALSE to hide computing progression.
+gapStat_plot <- fviz_nbclust(data[, 31:8770], kmeans, nstart = 25,  method = "gap_stat", nboot = 50)+
+  labs(subtitle = "Gap statistic method")
+
+png("cluster_elbow.png", width = 800, height = 500)
+elbow_plot
+dev.off()
+
+png("cluster_silhouette.png", width = 800, height = 500)
+silhouette_plot
+dev.off()
+
+png("cluster_gapstat.png", width = 800, height = 500)
+gapStat_plot
+dev.off()
+
+
+#More sophisticated gap analysis chart
+clust.gap.anal <- clusGap(data[, 31:8770], kmeans, K.max = 30, B = 100)
+
+plot(clust.gap.anal)
+
+```
+
+```{r K means model}
+k.means4.mod <- kcca(data[, 31:8770], k=4, kccaFamily("kmeans"))
+
+data$kmean4 <- predict(k.means4.mod)
+
+
+k.means7.mod <- kcca(data[, 31:8770], k=7, kccaFamily("kmeans"))
+
+data$kmean7 <- predict(k.means7.mod)
+```
+
+
+
+```{r PCA for kmeans visualisation}
+
+pca.data <- prcomp(data[, 31:8770], center = TRUE, scale. = TRUE)
+
+autoplot(pca.data, data = data, colour = data$kmean4, alpha=0.5, size=2) + scale_fill_manual(values = c("#FF1BB3","#A7FF5B","#99554D")) + scale_color_manual(values = c("black","white","orange"))
+
+ggsave("Kmeans4_PCA.png", plot = last_plot(), device = NULL, path = NULL,
+  scale = 1, width = 6, height = 4,
+  dpi = 300)
+
+autoplot(pca.data, data = data, colour = data$kmean7, alpha=0.5, size=2) + scale_fill_manual(values = c("#FF1BB3","#A7FF5B","#99554D")) + scale_color_manual(values = c("black","white","orange")) 
+
+ggsave("Kmeans7_PCA.png", plot = last_plot(), device = NULL, path = NULL,
+  scale = 1, width = 6, height = 4,
+  dpi = 300)
+
+```
+
+```{r}
+#correspondence between clusters and clinical features
+
+chi2.test <- chisq.test(table(data$kmean4,data$PAM50.mRNA))
+
+table(data$kmean4,data$PAM50.mRNA)
+
+chi2.test$p.value
+
+data$kmean4
+```
+
+
+
+
+
+# Repeating k-means and PCA process with only selected variables
+
+```{r K means model}
+k.means4.sig.mod <- kcca(data[,STABVARS.ind], k=4, kccaFamily("kmeans"))
+
+data$kmean4sig <- predict(k.means4.sig.mod)
+
+table(data$kmean4sig,data$PAM50.mRNA)
+
+k.means4.pam50.mod <- kcca(data[,pam50.ind], k=4, kccaFamily("kmeans"))
+
+data$kmean4pam <- predict(k.means4.pam50.mod)
+
+table(data$kmean4pam,data$PAM50.mRNA)
+
+```
+
+
+
+```{r PCA for kmeans visualisation}
+
+pca.data.sig <- prcomp(data[, STABVARS.ind], center = TRUE, scale. = TRUE)
+
+autoplot(pca.data.sig, data = data, colour = data$kmean4sig, alpha=0.5, size=2) + scale_fill_manual(values = c("#FF1BB3","#A7FF5B","#99554D")) + scale_color_manual(values = c("black","white","orange"))
+
+ggsave("Kmeans4sig_PCA.png", plot = last_plot(), device = NULL, path = NULL,
+  scale = 1, width = 6, height = 4,
+  dpi = 300)
+
+
+pca.data.pam <- prcomp(data[, pam50.ind], center = TRUE, scale. = TRUE)
+
+autoplot(pca.data.pam, data = data, colour = data$kmean4pam, alpha=0.5, size=2) + scale_fill_manual(values = c("#FF1BB3","#A7FF5B","#99554D")) + scale_color_manual(values = c("black","white","orange"))
+
+ggsave("KmeansPam_PCA.png", plot = last_plot(), device = NULL, path = NULL,
+  scale = 1, width = 6, height = 4,
+  dpi = 300)
+
+str(data$kmean4sig)
+```
+
+
+```{r}
+autoplot(pca.data.pam, data = data, colour = as.integer(data$PAM50.mRNA), alpha=0.5, size=2) + scale_fill_manual(values = c("#FF1BB3","#A7FF5B","#99554D")) + scale_color_manual(values = c("black","white","orange"))
+
+ggsave("PCA_for_subtype.png", plot = last_plot(), device = NULL, path = NULL,
+  scale = 1, width = 6, height = 4,
+  dpi = 300)
+
+table(data$kmean4pam,data$PAM50.mRNA)
+
+
+```
+
+
+```{r Other visualisations using my 4 clusters}
+
+ggplot(data, aes(as.factor(data$kmean4sig), data$diag_age, col = as.factor(data$kmean4sig))) + geom_boxplot()
+
+ggplot(data, aes(as.factor(data$PAM50.mRNA), data$diag_age, col = as.factor(data$PAM50.mRNA))) + geom_boxplot()
+```
+
+
+
+
+
+
+
+```{r Checking correlation between my selected variables and the gene variables}
+
+cormat <- cor(data[,c(STABVARS.ind,pam50.ind)])
+
+par(mfrow=c(2,2))
+
+png("corrplot_for_variable_selection_groups.png", width=1000, height=600)
+corrplot(cormat[31:59,1:30],tl.col = "black", tl.cex = 1, xlab="Lasso selected") 
+dev.off()
+
+```
+
+
+
+
+
+
+```{r Clustering witn only pam50 proteins}
+set.seed(123)
+
+# Elbow method
+elbow_plot1 <- fviz_nbclust(data[, pam50.ind], kmeans, method = "wss") +
+    geom_vline(xintercept = 4, linetype = 2)+
+  labs(subtitle = "Elbow method with PAM50 proteins")
+
+# Silhouette method
+silhouette_plot1 <- fviz_nbclust(data[, pam50.ind], kmeans, method = "silhouette")+
+  labs(subtitle = "Silhouette method with PAM50 proteins")
+
+# Gap statistic
+# nboot = 50 to keep the function speedy. 
+# recommended value: nboot= 500 for your analysis.
+# Use verbose = FALSE to hide computing progression.
+gapStat_plot1 <- fviz_nbclust(data[, pam50.ind], kmeans, nstart = 25,  method = "gap_stat", nboot = 50)+
+  labs(subtitle = "Gap statistic method")
+
+png("cluster_elbow_PAM50.png", width = 800, height = 500)
+elbow_plot1
+dev.off()
+
+png("cluster_silhouette_PAM50.png", width = 800, height = 500)
+silhouette_plot1
+dev.off()
+
+png("cluster_gapstat_PAM50.png", width = 800, height = 500)
+gapStat_plot1
+dev.off()
+
+
+#More sophisticated gap analysis chart
+clust.gap.anal1 <- clusGap(data[, pam50.ind], kmeans, K.max = 30, B = 100)
+
+plot(clust.gap.anal1)
+```
+
+
+```{r}
+write.csv(model_analysis, 'model_analysis.csv')
+```
+
